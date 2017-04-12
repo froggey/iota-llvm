@@ -30,7 +30,8 @@ OPTIONAL_DIRS := lldb
 # large and three small executables. This is done to minimize memory load
 # in parallel builds.  Please retain this ordering.
 DIRS := llvm-config
-PARALLEL_DIRS := pnacl-llc pnacl-abicheck pnacl-bcanalyzer pnacl-bcfuzz \
+PARALLEL_DIRS := iota \
+                 pnacl-llc pnacl-abicheck pnacl-bcanalyzer pnacl-bcfuzz \
                  pnacl-freeze pnacl-hack-memset pnacl-thaw pnacl-bccompress \
                  pnacl-bcdis \
                  pnacl-addnames opt llvm-as llvm-dis llc llvm-ar llvm-nm \

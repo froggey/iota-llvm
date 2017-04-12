@@ -145,7 +145,8 @@ public:
     CUDA,       // NVIDIA CUDA
     NVCL,       // NVIDIA OpenCL
     AMDHSA,     // AMD HSA Runtime
-    PS4
+    PS4,
+    Iota
   };
   enum EnvironmentType {
     UnknownEnvironment,

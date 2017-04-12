@@ -64,6 +64,8 @@ add_llvm_tool_subdirectory(pnacl-hack-memset)
 add_llvm_tool_subdirectory(pnacl-thaw)
 add_llvm_tool_subdirectory(pnacl-addnames)
 
+add_llvm_tool_subdirectory(iota)
+
 add_llvm_tool_subdirectory(llvm-c-test)
 
 add_llvm_tool_subdirectory(obj2yaml)
