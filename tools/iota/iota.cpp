@@ -17,6 +17,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/NaCl.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/Scalar.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/SourceMgr.h"
@@ -29,11 +34,14 @@
 
 using namespace llvm;
 
+extern void lowerBitcastTrunc(Module &M);
+extern void lowerVectorBswap(Module &M);
+
 static cl::opt<std::string>
 InputFilename(cl::Positional, cl::desc("<input file>"), cl::Required);
 
 static cl::opt<bool>
-EmitTypeDeclarartions("emit-type-declarations", cl::desc("Emit type declarations for variables"));
+EmitTypeDeclarartions("emit-type-declarations", cl::desc("Emit type declarations for variables"), cl::init(true));
 static cl::opt<bool>
 PrintLLVMInstructions("print-llvm-instructions", cl::desc("Print original LLVM instructions in comments interleaved with translated code"));
 
@@ -41,7 +49,7 @@ static cl::opt<std::string>
 PackageName("package", cl::desc("Package name"));
 
 static cl::opt<std::string>
-OptimizeQualities("optimize", cl::desc("Optimize qualties"));
+OptimizeQualities("optimize", cl::desc("Optimize qualities"));
 
 static cl::opt<std::string>
 ContextPersonality("personality", cl::desc("Context personality"));
@@ -50,7 +58,7 @@ static cl::opt<std::string>
 EntryPoint("entry-point", cl::desc("Symbol to use as the entry point"), cl::init("_start"));
 
 static cl::opt<bool>
-TranslateOnly("translate-only", cl::desc("Do not run additional LLVM passes"));
+TranslateOnly("translate-only", cl::desc("Only translate input, do not run additional LLVM passes"));
 
 static std::string escapeSymbol(StringRef name) {
     std::string result = "";
@@ -777,7 +785,15 @@ int main(int argc, char **argv) {
 
     llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
 
-    cl::ParseCommandLineOptions(argc, argv, "Iota LLVM -> CL transpiler\n");
+    SmallVector<const char *, 32> modified_args(&argv[0], &argv[argc]);
+    modified_args.push_back("-scalarize-load-store");
+
+    PassRegistry &Registry = *PassRegistry::getPassRegistry();
+    initializeCore(Registry);
+    initializeScalarOpts(Registry);
+
+    cl::ParseCommandLineOptions(modified_args.size(), &modified_args[0],
+                                "Iota LLVM -> CL transpiler\n");
 
     LLVMContext context;
     SMDiagnostic err;
@@ -787,6 +803,38 @@ int main(int argc, char **argv) {
         err.print("iota", errs());
         return -1;
     }
+
+    if(!TranslateOnly) {
+        lowerVectorBswap(*module);
+
+        legacy::PassManager PM;
+
+        // Internalize all symbols in the module except the entry point.
+        const char *export_name = EntryPoint.c_str();
+        PM.add(createInternalizePass(export_name));
+        // Discard all unused functions & globals.
+        PM.add(createGlobalDCEPass());
+
+        // Simplification passes.
+        PM.add(createExpandVarArgsPass());
+        PM.add(createScalarizerPass());
+        PM.add(createSimplifyAllocasPass());
+        PM.add(createExpandGetElementPtrPass());
+        PM.add(createExpandArithWithOverflowPass());
+        PM.add(createLowerSwitchPass());
+        PM.add(createPromoteI1OpsPass());
+        PM.add(createPromoteIntegersPass());
+        PM.add(createExpandLargeIntegersPass());
+
+        PM.run(*module);
+
+        lowerBitcastTrunc(*module);
+
+        legacy::PassManager PM2;
+        PM2.add(createInstructionCombiningPass());
+        PM2.run(*module);
+    }
+
     unsigned long long data_origin = 0x200000;
     unsigned long long data_end = data_origin;
     unsigned long long next_fn_id = 1;

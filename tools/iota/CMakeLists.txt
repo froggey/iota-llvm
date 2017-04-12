@@ -4,6 +4,8 @@ set(LLVM_LINK_COMPONENTS
   CodeGen
   Core
   IRReader
+  NaClAnalysis
+  NaClTransforms
   ScalarOpts
   SelectionDAG
   Support
@@ -11,4 +13,6 @@ set(LLVM_LINK_COMPONENTS
 
 add_llvm_tool(iota
   iota.cpp
+  LowerBitcastTrunc.cpp
+  LowerVectorBswap.cpp
   )

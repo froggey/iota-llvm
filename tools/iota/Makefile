@@ -9,6 +9,6 @@
 
 LEVEL := ../..
 TOOLNAME := iota
-LINK_COMPONENTS := bitreader asmparser irreader
+LINK_COMPONENTS := bitreader asmparser irreader naclanalysis nacltransforms
 
 include $(LEVEL)/Makefile.common
