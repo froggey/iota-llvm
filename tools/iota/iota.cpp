@@ -812,8 +812,6 @@ int main(int argc, char **argv) {
         // Internalize all symbols in the module except the entry point.
         const char *export_name = EntryPoint.c_str();
         PM.add(createInternalizePass(export_name));
-        // Discard all unused functions & globals.
-        PM.add(createGlobalDCEPass());
 
         // Simplification passes.
         PM.add(createExpandVarArgsPass());
@@ -833,6 +831,7 @@ int main(int argc, char **argv) {
         legacy::PassManager PM2;
         PM2.add(createInstructionCombiningPass());
         PM2.add(createStripSymbolsPass(true));
+        PM2.add(createGlobalDCEPass());
         PM2.run(*module);
     }
 
