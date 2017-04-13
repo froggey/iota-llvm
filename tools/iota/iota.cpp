@@ -832,6 +832,7 @@ int main(int argc, char **argv) {
 
         legacy::PassManager PM2;
         PM2.add(createInstructionCombiningPass());
+        PM2.add(createStripSymbolsPass(true));
         PM2.run(*module);
     }
 
