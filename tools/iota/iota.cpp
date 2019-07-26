@@ -19,6 +19,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/NaCl.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
@@ -74,8 +75,10 @@ class IotaFunctionTranslator {
 public:
     IotaTranslator *global;
     std::unordered_map<Value*, std::string> name_table;
+    DominatorTree dom;
 
     StringRef valueForPrinting(Value *value);
+    void translateBlock(BasicBlock &bb);
 };
 
 class IotaBlockTranslator {
@@ -84,7 +87,7 @@ public:
     std::vector<Instruction *> remaining;
 
     std::string translateInstruction(Instruction *inst);
-    bool canFuseValue(Instruction *user, Value *value);
+    bool maybeFuseValue(Instruction *user, Value *value);
     std::string useValue(Instruction *user, Value *value);
     std::string prepareForBranch(Instruction *user, BasicBlock *destination, const char *indent, bool use_value);
 };
@@ -226,6 +229,7 @@ static std::string reallyValueForPrinting(Module *module,
                 }
             }
         }
+        // FIXME: These should generate proper CL floats with appropriate exponent characters.
         std::string str(buf.begin(), buf.end());
         if(CFP->getType()->isFloatTy()) {
             return "(float " + str + ")";
@@ -405,23 +409,23 @@ static bool isSetjmpCall(Instruction &inst) {
     return true;
 }
 
-bool IotaBlockTranslator::canFuseValue(Instruction *user, Value *value) {
-    return isa<Instruction>(value) && value->hasOneUse() && !remaining.empty() && remaining.back() == value;
+bool IotaBlockTranslator::maybeFuseValue(Instruction *user, Value *value) {
+    if(isa<Instruction>(value) &&
+       value->hasOneUse() &&
+       !isSetjmpCall(cast<Instruction>(*value)) &&
+       !remaining.empty() && remaining.back() == value) {
+        // if the last instruction on the stack is this value and it
+        // only has one use, then fold that instruction into this one.
+        remaining.pop_back();
+        return true;
+    } else {
+        return false;
+    }
 }
 
 std::string IotaBlockTranslator::useValue(Instruction *user, Value *value) {
-    if(isa<Instruction>(value)) {
-        if(value->hasOneUse() && !remaining.empty() && remaining.back() == value) {
-            // if the last instruction on the stack is this value and it
-            // only has one use, then fold that instruction into this one.
-            remaining.pop_back();
-            return translateInstruction(cast<Instruction>(value));
-        } else {
-            // Otherwise leave it in place and just use the name.
-            return this->function->name_table[value];
-        }
-    } else if(isa<Argument>(value)) {
-        return this->function->name_table[value];
+    if(maybeFuseValue(user, value)) {
+        return translateInstruction(cast<Instruction>(value));
     }
 
     return this->function->valueForPrinting(value);
@@ -513,9 +517,8 @@ std::string IotaBlockTranslator::translateInstruction(Instruction *inst) {
         if(B.isConditional()) {
             // TODO: Examine or.i1 and and.i1 instructions too.
             // These can be transformed, but care must be taken to avoid short-circuiting.
-            if(isa<CmpInst>(B.getCondition()) && canFuseValue(inst, B.getCondition())) {
+            if(isa<CmpInst>(B.getCondition()) && maybeFuseValue(inst, B.getCondition())) {
                 auto &CI = cast<CmpInst>(*B.getCondition());
-                remaining.pop_back(); // We're fusing this instruction manually.
                 // Proper evaluation order...
                 auto rhs = useValue(&CI, CI.getOperand(1));
                 auto lhs = useValue(&CI, CI.getOperand(0));
@@ -558,37 +561,24 @@ std::string IotaBlockTranslator::translateInstruction(Instruction *inst) {
             report_fatal_error("Inline asm? You must be joking!");
         }
         if(isSetjmpCall(*inst)) {
-            auto result = std::string("");
-            result += std::string("(call-direct ") + escapeSymbol(call.getCalledFunction()->getName()) + " setjmp-thunk." + function->name_table[inst];
-            for(auto &operand: call.arg_operands()) {
-                result += std::string(" ") + std::string(function->valueForPrinting(operand));
-            }
-            result += ")\n";
-            result += "        (setq " + function->name_table[inst] + " 0)\n";
-            result += "        (go setjmp-resume." + function->name_table[inst] + ")\n";
-            result += "      setjmp-target." + function->name_table[inst] + "\n";
-            result += "        (setq " + function->name_table[inst] + " 1)\n";
-            result += "        (go setjmp-resume." + function->name_table[inst] + ")\n";
-            result += "      setjmp-resume." + function->name_table[inst] + "\n";
-            return result;
-        } else {
-            auto result = std::string("");
-            // Work in reverse to ensure operands are evaluated in the right order.
-            std::vector<std::string> operands(call.getNumArgOperands());
-            for(unsigned i = call.getNumArgOperands(); i != 0; i--) {
-                operands[i-1] = useValue(inst, call.getArgOperand(i-1));
-            }
-            if(auto target = call.getCalledFunction()) {
-                result += "(call-direct " + escapeSymbol(target->getName());
-            } else {
-                result += "(call-indirect " + useValue(inst, call.getCalledValue());
-            }
-            for(auto &operand: operands) {
-                result += " " + operand;
-            }
-            result += ")";
-            return result;
+            return "";
         }
+        auto result = std::string("");
+        // Work in reverse to ensure operands are evaluated in the right order.
+        std::vector<std::string> operands(call.getNumArgOperands());
+        for(unsigned i = call.getNumArgOperands(); i != 0; i--) {
+            operands[i-1] = useValue(inst, call.getArgOperand(i-1));
+        }
+        if(auto target = call.getCalledFunction()) {
+            result += "(call-direct " + escapeSymbol(target->getName());
+        } else {
+            result += "(call-indirect " + useValue(inst, call.getCalledValue());
+        }
+        for(auto &operand: operands) {
+            result += " " + operand;
+        }
+        result += ")";
+        return result;
     }
     case Instruction::Select: {
         auto &select = cast<SelectInst>(*inst);
@@ -625,9 +615,110 @@ std::string IotaBlockTranslator::translateInstruction(Instruction *inst) {
     }
 }
 
+void IotaFunctionTranslator::translateBlock(BasicBlock &bb) {
+    IotaBlockTranslator block_xlat;
+    block_xlat.function = this;
+    for(auto &inst: bb) {
+        if(!isa<PHINode>(inst)) {
+            block_xlat.remaining.push_back(&inst);
+        }
+    }
+    std::vector<std::pair<Instruction *, std::string>> entries;
+    // Working backwards.
+    while(!block_xlat.remaining.empty()) {
+        auto inst = block_xlat.remaining.back();
+        block_xlat.remaining.pop_back();
+        entries.push_back(std::make_pair(inst, block_xlat.translateInstruction(inst)));
+    }
+    // Work backwards again to emit them in the right order.
+    std::string close_parens = "";
+    std::vector<std::string> pending_type_decls;
+    bool in_let = false;
+    while(!entries.empty()) {
+        auto entry = entries.back();
+        entries.pop_back();
+        auto inst = entry.first;
+        auto code = entry.second;
+        if(isSetjmpCall(*inst)) {
+            if(in_let) {
+                // Close up the current LET*
+                close_parens += ")";
+                outs() << ")\n         " << "(declare ";
+                for(auto &decl: pending_type_decls) {
+                    outs() << decl << "\n";
+                }
+                outs() << ")\n";
+                pending_type_decls.clear();
+                in_let = false;
+            }
+            auto &call = cast<CallInst>(*inst);
+            outs() << "(tagbody\n";
+            // Generate a setjmp thunk variable for this instruction.
+            outs() << "        (setf setjmp-thunk." << name_table[inst] << " (setjmp.prepare setjmp-target." << name_table[inst] << "))\n";
+            outs() << "(call-direct " << escapeSymbol(call.getCalledFunction()->getName()) << " setjmp-thunk." + name_table[inst];
+            for(auto &operand: call.arg_operands()) {
+                outs() << " " << valueForPrinting(operand);
+            }
+            outs() << ")\n";
+            outs() << "        (setq " << name_table[inst] << " 0)\n";
+            outs() << "        (go setjmp-resume." << name_table[inst] << ")\n";
+            outs() << "      setjmp-target." << name_table[inst] << "\n";
+            outs() << "        (setq " << name_table[inst] << " 1)\n";
+            outs() << "        (go setjmp-resume." << name_table[inst] << ")\n";
+            outs() << "      setjmp-resume." << name_table[inst] << "\n";
+            close_parens += ")"; // close up the tagbody.
+        } else if(inst->getType()->isVoidTy() ||
+                  inst->use_empty()) {
+            if(in_let) {
+                // Close up the current LET*
+                close_parens += ")";
+                outs() << ")\n         " << "(declare ";
+                for(auto &decl: pending_type_decls) {
+                    outs() << decl << "\n";
+                }
+                outs() << ")\n";
+                pending_type_decls.clear();
+                in_let = false;
+            }
+            if(entries.empty() && !dom[&bb]->getChildren().empty()) {
+                // This is the block's terminator instruction.
+                // Any blocks that this block immediately dominates will be emitted after
+                // it, but in a tagbody with the right scope. Emit the tagbody here
+                // so labels are visible.
+                outs() << "(tagbody\n";
+                close_parens += ")";
+            }
+            // nothing - result not used.
+            outs() << "         " << code << "\n";
+        } else {
+            // Local to the basic block and its children in the dominator tree.
+            if(in_let) {
+                outs() << "\n         " << "       (" << name_table[inst] << " " << code << ")";
+            } else {
+                outs() << "         " << "(let* ((" << name_table[inst] << " " << code << ")";
+                in_let = true;
+            }
+            if(EmitTypeDeclarartions) {
+                pending_type_decls.push_back(std::string("(type ") + std::string(clTypeName(global->module, inst->getType())) + " " + name_table[inst] + ")");
+            }
+        }
+    }
+    // Now emit any child blocks.
+    // TODO: Be more clever about this. BR could be changed to emit the block inline if it one has one predecessor
+    // and the BR dominates the target.
+    for(auto &child: *dom[&bb]) {
+        outs() << "       " << name_table[child->getBlock()] << "\n";
+        translateBlock(*child->getBlock());
+    }
+    if(!close_parens.empty()) {
+        outs() << close_parens << "\n";
+    }
+}
+
 static void translateFunction(IotaTranslator *xlat, Function &fn) {
     IotaFunctionTranslator function_xlat;
     function_xlat.global = xlat;
+    function_xlat.dom = DominatorTreeAnalysis().run(fn);
 
     outs() << "(define-llvm-function " << escapeSymbol(fn.getName()) << " ((";
     std::unordered_map<Value*, std::string> &name_table = function_xlat.name_table;
@@ -689,7 +780,7 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
             name_table[&inst] = escapeSymbol(name);
         }
     }
-    // Create variables for instructions that span basic blocks.
+    // Create variables for PHINodes.
     outs() << "  (let (";
     for(auto &bb: fn) {
         for(auto &inst: bb) {
@@ -700,9 +791,11 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
             std::string &name = name_table[&inst];
             if(isSetjmpCall(inst)) {
                 // Generate a setjmp thunk variable for this instruction.
+                // And also the variable to hold the setjmp result
                 outs() << "(setjmp-thunk." << name << " nil)\n        ";
+                outs() << "(" << name << " nil)\n        ";
             }
-            if(!isa<PHINode>(inst) && !inst.isUsedOutsideOfBlock(inst.getParent())) {
+            if(!isa<PHINode>(inst)) {
                 continue;
             }
             outs() << "(" << name << " " << clTypeInitializer(ty) << ")\n        ";
@@ -721,7 +814,7 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
                 if(ty->isVoidTy()) {
                     continue;
                 }
-                if(!isa<PHINode>(inst) && !inst.isUsedOutsideOfBlock(inst.getParent())) {
+                if(!isa<PHINode>(inst)) {
                     continue;
                 }
                 outs() << "(type " << clTypeName(xlat->module, ty) << " " << name_table[&inst] << ")\n             ";
@@ -731,58 +824,13 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
     }
     outs() << "    (block nil\n";
     outs() << "      (tagbody\n";
-    for(auto &bb: fn) {
-        for(auto &inst: bb) {
-            if(isSetjmpCall(inst)) {
-                // Generate a setjmp thunk variable for this instruction.
-                outs() << "        (setf setjmp-thunk." << name_table[&inst] << " (setjmp.prepare setjmp-target." << name_table[&inst] << "))\n";
-            }
-        }
-    }
-
     // Generate code for each basic block.
-    for(auto &bb: fn) {
-        outs() << "       " << name_table[&bb] << "\n";
-        IotaBlockTranslator block_xlat;
-        block_xlat.function = &function_xlat;
-        for(auto &inst: bb) {
-            if(!isa<PHINode>(inst)) {
-                block_xlat.remaining.push_back(&inst);
-            }
-        }
-        std::vector<std::pair<Instruction *, std::string>> entries;
-        // Working backwards.
-        while(!block_xlat.remaining.empty()) {
-            auto inst = block_xlat.remaining.back();
-            block_xlat.remaining.pop_back();
-            entries.push_back(std::make_pair(inst, block_xlat.translateInstruction(inst)));
-        }
-        // Work backwards again to emit them in the right order.
-        std::string close_parens = "";
-        while(!entries.empty()) {
-            auto entry = entries.back();
-            entries.pop_back();
-            auto inst = entry.first;
-            auto code = entry.second;
-            if(inst->getType()->isVoidTy() ||
-               inst->use_empty() ||
-               isSetjmpCall(*inst)) {
-                // nothing - result not used.
-                outs() << "         " << code << "\n";
-            } else if(inst->isUsedOutsideOfBlock(inst->getParent())) {
-                // Not local to the basic block
-                outs() << "         " << "(setf " << name_table[inst] << " " << code << ")\n";
-            } else {
-                // Local to the basic block.
-                outs() << "         " << "(let ((" << name_table[inst] << " " << code << "))\n";
-                if(EmitTypeDeclarartions) {
-                    outs() << "         " << "    (declare (type " << clTypeName(xlat->module, inst->getType()) << " " << name_table[inst] << "))\n";
-                }
-                close_parens += ")";
-            }
-        }
-        outs() << close_parens << "\n";
-    }
+    // Traverse the dominator tree to get nesting right.
+    // TODO: This does not work right for particularly perverse uses of setjmp,
+    // where the call to setjmp does not dominate all calls to longjmp.
+    // These kinds of uses will manifest as GOs to expired GO tags.
+    // FIXME: Can instructions jump to the entry block? Don't think so...
+    function_xlat.translateBlock(fn.getEntryBlock());
     outs() << "))))\n\n";
 }
 
