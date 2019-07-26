@@ -61,6 +61,34 @@ EntryPoint("entry-point", cl::desc("Symbol to use as the entry point"), cl::init
 static cl::opt<bool>
 TranslateOnly("translate-only", cl::desc("Only translate input, do not run additional LLVM passes"));
 
+static cl::opt<bool>
+LibraryMode("library-mode", cl::desc("Don't export _start, only symbols specified with -internalize-public-api-file or -internalize-public-api-list"));
+
+class IotaTranslator {
+public:
+    Module *module;
+    std::unordered_map<GlobalObject *, unsigned long long> global_table;
+};
+
+class IotaFunctionTranslator {
+public:
+    IotaTranslator *global;
+    std::unordered_map<Value*, std::string> name_table;
+
+    StringRef valueForPrinting(Value *value);
+};
+
+class IotaBlockTranslator {
+public:
+    IotaFunctionTranslator *function;
+    std::vector<Instruction *> remaining;
+
+    std::string translateInstruction(Instruction *inst);
+    bool canFuseValue(Instruction *user, Value *value);
+    std::string useValue(Instruction *user, Value *value);
+    std::string prepareForBranch(Instruction *user, BasicBlock *destination, const char *indent, bool use_value);
+};
+
 static std::string escapeSymbol(StringRef name) {
     std::string result = "";
     result += "|";
@@ -77,9 +105,9 @@ static std::string escapeSymbol(StringRef name) {
     return result;
 }
 
-static uint64_t resolveConstantInteger(std::unique_ptr<Module> &module, std::unordered_map<GlobalObject *, unsigned long long> &global_table, Constant *value);
+static uint64_t resolveConstantInteger(Module *module, std::unordered_map<GlobalObject *, unsigned long long> &global_table, Constant *value);
 
-static uint64_t reallyResolveConstantInteger(std::unique_ptr<Module> &module, std::unordered_map<GlobalObject *, unsigned long long> &global_table, Constant *value) {
+static uint64_t reallyResolveConstantInteger(Module *module, std::unordered_map<GlobalObject *, unsigned long long> &global_table, Constant *value) {
     if(auto CE = dyn_cast<ConstantExpr>(value)) {
         if(CE->getOpcode() == Instruction::BitCast || CE->getOpcode() == Instruction::IntToPtr || CE->getOpcode() == Instruction::PtrToInt) {
             return resolveConstantInteger(module, global_table, cast<Constant>(CE->getOperand(0)));
@@ -146,7 +174,7 @@ static uint64_t reallyResolveConstantInteger(std::unique_ptr<Module> &module, st
 
 static std::unordered_map<Constant *, uint64_t> constant_value_cache;
 
-static uint64_t resolveConstantInteger(std::unique_ptr<Module> &module, std::unordered_map<GlobalObject *, unsigned long long> &global_table, Constant *value) {
+static uint64_t resolveConstantInteger(Module *module, std::unordered_map<GlobalObject *, unsigned long long> &global_table, Constant *value) {
     auto itr = constant_value_cache.find(value);
     if(itr != constant_value_cache.end()) {
         return itr->second;
@@ -156,7 +184,7 @@ static uint64_t resolveConstantInteger(std::unique_ptr<Module> &module, std::uno
     return integer;
 }
 
-static std::string reallyValueForPrinting(std::unique_ptr<Module> &module,
+static std::string reallyValueForPrinting(Module *module,
                                           std::unordered_map<GlobalObject *, unsigned long long> &global_table,
                                           Constant *value) {
     if(auto cint = dyn_cast<ConstantInt>(value)) {
@@ -213,10 +241,7 @@ static std::string reallyValueForPrinting(std::unique_ptr<Module> &module,
 
 static std::unordered_map<Constant *, std::string> constant_representation_cache;
 
-static StringRef valueForPrinting(std::unique_ptr<Module> &module,
-                                  std::unordered_map<Value*, std::string> &name_table,
-                                  std::unordered_map<GlobalObject *, unsigned long long> &global_table,
-                                  Value *value) {
+StringRef IotaFunctionTranslator::valueForPrinting(Value *value) {
     if(isa<Instruction>(value) || isa<Argument>(value)) {
         return name_table[value];
     }
@@ -225,7 +250,7 @@ static StringRef valueForPrinting(std::unique_ptr<Module> &module,
         if(itr != constant_representation_cache.end()) {
             return itr->second;
         }
-        auto repr = reallyValueForPrinting(module, global_table, C);
+        auto repr = reallyValueForPrinting(global->module, global->global_table, C);
         constant_representation_cache[C] = repr;
         return constant_representation_cache[C];
     }
@@ -235,10 +260,9 @@ static StringRef valueForPrinting(std::unique_ptr<Module> &module,
     abort();
 }
 
-static void prepareForBranch(std::unique_ptr<Module> &module,
-                             std::unordered_map<Value*, std::string> &name_table,
-                             std::unordered_map<GlobalObject *, unsigned long long> &global_table,
-                             BasicBlock *origin, BasicBlock *destination, const char *indent) {
+std::string IotaBlockTranslator::prepareForBranch(Instruction *user, BasicBlock *destination, const char *indent, bool use_value) {
+    BasicBlock *origin = user->getParent();
+    std::string result;
     bool first = true;
     for(auto &inst: *destination) {
         auto phi = dyn_cast<PHINode>(&inst);
@@ -246,21 +270,27 @@ static void prepareForBranch(std::unique_ptr<Module> &module,
             break;
         }
         if(first) {
-            outs() << indent << "(psetq ";
+            result += indent + std::string("(psetq ");
             first = false;
         } else {
-            outs() << "\n" << indent << "       ";
+            result += std::string("\n") + indent + "       ";
         }
 
         auto val = phi->getIncomingValueForBlock(origin);
-        outs() << name_table[&inst] << " " << valueForPrinting(module, name_table, global_table, val);
+        result += function->name_table[&inst] + " ";
+        if(use_value) {
+            result += useValue(user, val);
+        } else {
+            result += function->valueForPrinting(val);
+        }
     }
     if(!first) {
-        outs() << ")\n";
+        result += ")\n";
     }
+    return result;
 }
 
-static std::string reallyTypeSuffix(std::unique_ptr<Module> &module, Type *ty) {
+static std::string reallyTypeSuffix(Module *module, Type *ty) {
     if(auto ity = dyn_cast<IntegerType>(ty)) {
         return "i" + std::to_string(ity->getBitWidth());
     }
@@ -280,7 +310,7 @@ static std::string reallyTypeSuffix(std::unique_ptr<Module> &module, Type *ty) {
 
 static std::unordered_map<Type *, std::string> type_suffix_cache;
 
-static StringRef typeSuffix(std::unique_ptr<Module> &module, Type *ty) {
+static StringRef typeSuffix(Module *module, Type *ty) {
     auto itr = type_suffix_cache.find(ty);
     if(itr != type_suffix_cache.end()) {
         return itr->second;
@@ -324,9 +354,9 @@ static const char *getPredicateText(unsigned predicate) {
   return pred;
 }
 
-static std::string reallyClTypeName(Type *ty) {
+static std::string reallyClTypeName(Module *module, Type *ty) {
     if(ty->isPointerTy()) {
-        return "(unsigned-byte 64)";
+        return "(unsigned-byte " + std::to_string(module->getDataLayout().getPointerSizeInBits(ty->getPointerAddressSpace())) + ")";
     } else if(ty->isIntegerTy()) {
         return "(unsigned-byte " + std::to_string(ty->getIntegerBitWidth()) + ")";
     } else if(ty->isFloatTy()) {
@@ -341,12 +371,12 @@ static std::string reallyClTypeName(Type *ty) {
 
 static std::unordered_map<Type *, std::string> cl_type_name_cache;
 
-static StringRef clTypeName(Type *ty) {
+static StringRef clTypeName(Module *module, Type *ty) {
     auto itr = cl_type_name_cache.find(ty);
     if(itr != cl_type_name_cache.end()) {
         return itr->second;
     }
-    auto value = reallyClTypeName(ty);
+    auto value = reallyClTypeName(module, ty);
     cl_type_name_cache[ty] = value;
     return cl_type_name_cache[ty];
 }
@@ -364,35 +394,6 @@ static const char *clTypeInitializer(Type *ty) {;
     }
 }
 
-static Instruction *nextInstruction(Instruction *inst) {
-    BasicBlock::iterator I(inst);
-    ++I;
-    return &*I;
-}
-
-static bool isFusableCmpAndBranchPair(Instruction &inst) {
-    // A cmp/br pair can be fused if the branch's condition is the comparison
-    // and the comparison is only used by the branch.
-    if(!isa<CmpInst>(inst)) {
-        return false;
-    }
-    auto next = nextInstruction(&inst);
-    auto B = dyn_cast<BranchInst>(next);
-    if(!B) {
-        return false;
-    }
-    if(!B->isConditional()) {
-        return false;
-    }
-    if(B->getCondition() != &inst) {
-        return false;
-    }
-    if(!inst.hasOneUse()) {
-        return false;
-    }
-    return true;
-}
-
 static bool isSetjmpCall(Instruction &inst) {
     auto CI = dyn_cast<CallInst>(&inst);
     if(!CI) {
@@ -404,10 +405,232 @@ static bool isSetjmpCall(Instruction &inst) {
     return true;
 }
 
-static void translateFunction(std::unique_ptr<Module> &module, std::unordered_map<GlobalObject *, unsigned long long> &global_table, Function &fn) {
-    auto &DL = module->getDataLayout();
+bool IotaBlockTranslator::canFuseValue(Instruction *user, Value *value) {
+    return isa<Instruction>(value) && value->hasOneUse() && !remaining.empty() && remaining.back() == value;
+}
+
+std::string IotaBlockTranslator::useValue(Instruction *user, Value *value) {
+    if(isa<Instruction>(value)) {
+        if(value->hasOneUse() && !remaining.empty() && remaining.back() == value) {
+            // if the last instruction on the stack is this value and it
+            // only has one use, then fold that instruction into this one.
+            remaining.pop_back();
+            return translateInstruction(cast<Instruction>(value));
+        } else {
+            // Otherwise leave it in place and just use the name.
+            return this->function->name_table[value];
+        }
+    } else if(isa<Argument>(value)) {
+        return this->function->name_table[value];
+    }
+
+    return this->function->valueForPrinting(value);
+}
+
+std::string IotaBlockTranslator::translateInstruction(Instruction *inst) {
+    switch(inst->getOpcode()) {
+    case Instruction::Alloca: {
+        auto &DL = function->global->module->getDataLayout();
+        AllocaInst &AI = cast<AllocaInst>(*inst);
+        if(!AI.isStaticAlloca()) {
+            report_fatal_error("Non-static alloca");
+        }
+        auto size = cast<ConstantInt>(AI.getArraySize());
+        return std::string("(alloca ") + std::to_string(size->getZExtValue() * DL.getTypeAllocSize(AI.getAllocatedType())) + ")";
+    }
+    case Instruction::PtrToInt:
+    case Instruction::IntToPtr: {
+        // These are no-op casts.
+        return useValue(inst, inst->getOperand(0));
+    }
+    case Instruction::Add:
+    case Instruction::FAdd:
+    case Instruction::Sub:
+    case Instruction::FSub:
+    case Instruction::Mul:
+    case Instruction::FMul:
+    case Instruction::UDiv:
+    case Instruction::SDiv:
+    case Instruction::FDiv:
+    case Instruction::URem:
+    case Instruction::SRem:
+    case Instruction::FRem:
+    case Instruction::Shl:
+    case Instruction::LShr:
+    case Instruction::AShr:
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor: {
+        // Proper evaluation order...
+        auto rhs = useValue(inst, inst->getOperand(1));
+        auto lhs = useValue(inst, inst->getOperand(0));
+        return std::string("(") + std::string(inst->getOpcodeName(inst->getOpcode())) + "." + std::string(typeSuffix(function->global->module, inst->getType()))
+            + " " + lhs + " " + rhs + ")";
+    }
+    case Instruction::BitCast:
+    case Instruction::Trunc:
+    case Instruction::ZExt:
+    case Instruction::SExt:
+    case Instruction::FPToUI:
+    case Instruction::FPToSI:
+    case Instruction::UIToFP:
+    case Instruction::SIToFP:
+    case Instruction::FPTrunc:
+    case Instruction::FPExt: {
+        auto lhs_type = typeSuffix(function->global->module, inst->getOperand(0)->getType());
+        auto rhs_type = typeSuffix(function->global->module, inst->getType());
+        // If this is a bitcast and both side have the same type, then just return the operand.
+        if(inst->getOpcode() == Instruction::BitCast && lhs_type == rhs_type) {
+            return useValue(inst, inst->getOperand(0));
+        } else {
+            return std::string("(") + std::string(inst->getOpcodeName(inst->getOpcode())) + "." + std::string(lhs_type) + "." + std::string(rhs_type)
+                + " " + useValue(inst, inst->getOperand(0)) + ")";
+        }
+    }
+    case Instruction::ICmp:
+    case Instruction::FCmp: {
+        auto &CI = cast<CmpInst>(*inst);
+        // Proper evaluation order...
+        auto rhs = useValue(&CI, CI.getOperand(1));
+        auto lhs = useValue(&CI, CI.getOperand(0));
+        return std::string("(") + std::string(inst->getOpcodeName(CI.getOpcode())) + "." + getPredicateText(CI.getPredicate()) + "." + std::string(typeSuffix(function->global->module, CI.getOperand(0)->getType()))
+               + " " + lhs + " " + rhs + ")";
+    }
+    case Instruction::Load: {
+        return std::string("(load.") + std::string(typeSuffix(function->global->module, inst->getType())) + " " + useValue(inst, inst->getOperand(0)) + ")";
+    }
+    case Instruction::Store: {
+        // Proper evaluation order...
+        auto rhs = useValue(inst, inst->getOperand(1));
+        auto lhs = useValue(inst, inst->getOperand(0));
+        return std::string("(store.") + std::string(typeSuffix(function->global->module, inst->getOperand(0)->getType()))
+            + " " + lhs + " " + rhs + ")";
+    }
+    case Instruction::Br: {
+        auto result = std::string("");
+        auto &B = cast<BranchInst>(*inst);
+        // TODO: do cmp fusing here - peer through or.i1/and.i1 instructions too.
+        if(B.isConditional()) {
+            // TODO: Examine or.i1 and and.i1 instructions too.
+            // These can be transformed, but care must be taken to avoid short-circuiting.
+            if(isa<CmpInst>(B.getCondition()) && canFuseValue(inst, B.getCondition())) {
+                auto &CI = cast<CmpInst>(*B.getCondition());
+                remaining.pop_back(); // We're fusing this instruction manually.
+                // Proper evaluation order...
+                auto rhs = useValue(&CI, CI.getOperand(1));
+                auto lhs = useValue(&CI, CI.getOperand(0));
+                result += std::string("(if (") + std::string(CI.getOpcodeName(CI.getOpcode())) + "." + getPredicateText(CI.getPredicate()) + ".fused." + std::string(typeSuffix(function->global->module, CI.getOperand(0)->getType()))
+                    + " " + lhs + " " + rhs + ")\n";
+            } else {
+                result += "(if (not (eql " + useValue(inst, B.getCondition()) + " 0))\n";
+            }
+            result += "            (progn\n";
+            result += prepareForBranch(inst, B.getSuccessor(0), "              ", false);
+            result += "              (go " + std::string(function->name_table[B.getSuccessor(0)]) + "))\n";
+            result += "            (progn\n";
+            result += prepareForBranch(inst, B.getSuccessor(1), "              ", false);
+            result += "              (go " + std::string(function->name_table[B.getSuccessor(1)]) + ")))";
+        } else {
+            result += prepareForBranch(inst, B.getSuccessor(0), "", true);
+            if(isa<PHINode>(B.getSuccessor(0)->front())) {
+                result += "        ";
+            }
+            result += "(go " + std::string(function->name_table[B.getSuccessor(0)]) + ")";
+        }
+        return result;
+    }
+    case Instruction::Ret: {
+        auto &ret = cast<ReturnInst>(*inst);
+        auto val = ret.getReturnValue();
+        if(val) {
+            return "(return " + useValue(inst, val) + ")";
+        } else {
+            return "(return)";
+        }
+    }
+    case Instruction::Unreachable: {
+        return "(error \"Reached unreachable!\")";
+    }
+    case Instruction::Call: {
+        auto &call = cast<CallInst>(*inst);
+        if(call.isInlineAsm()) {
+            errs() << "Unsupported instruction " << inst << "\n";
+            report_fatal_error("Inline asm? You must be joking!");
+        }
+        if(isSetjmpCall(*inst)) {
+            auto result = std::string("");
+            result += std::string("(call-direct ") + escapeSymbol(call.getCalledFunction()->getName()) + " setjmp-thunk." + function->name_table[inst];
+            for(auto &operand: call.arg_operands()) {
+                result += std::string(" ") + std::string(function->valueForPrinting(operand));
+            }
+            result += ")\n";
+            result += "        (setq " + function->name_table[inst] + " 0)\n";
+            result += "        (go setjmp-resume." + function->name_table[inst] + ")\n";
+            result += "      setjmp-target." + function->name_table[inst] + "\n";
+            result += "        (setq " + function->name_table[inst] + " 1)\n";
+            result += "        (go setjmp-resume." + function->name_table[inst] + ")\n";
+            result += "      setjmp-resume." + function->name_table[inst] + "\n";
+            return result;
+        } else {
+            auto result = std::string("");
+            // Work in reverse to ensure operands are evaluated in the right order.
+            std::vector<std::string> operands(call.getNumArgOperands());
+            for(unsigned i = call.getNumArgOperands(); i != 0; i--) {
+                operands[i-1] = useValue(inst, call.getArgOperand(i-1));
+            }
+            if(auto target = call.getCalledFunction()) {
+                result += "(call-direct " + escapeSymbol(target->getName());
+            } else {
+                result += "(call-indirect " + useValue(inst, call.getCalledValue());
+            }
+            for(auto &operand: operands) {
+                result += " " + operand;
+            }
+            result += ")";
+            return result;
+        }
+    }
+    case Instruction::Select: {
+        auto &select = cast<SelectInst>(*inst);
+        // TODO: Try fusing conditionals here.
+        // evaluation order.
+        auto false_val = useValue(inst, select.getFalseValue());
+        auto true_val = useValue(inst, select.getTrueValue());
+        auto cond_val = useValue(inst, select.getCondition());
+        return std::string("(select ") + cond_val + " " + true_val + " " + false_val + ")";
+    }
+    case Instruction::GetElementPtr: {
+        auto &DL = function->global->module->getDataLayout();
+        auto &GEP = cast<GetElementPtrInst>(*inst);
+        if(!GEP.hasAllConstantIndices()) {
+            errs() << "Unsupported instruction " << (*inst) << "\n";
+            report_fatal_error(std::string("Unsupported instruction ") +
+                               inst->getOpcodeName(inst->getOpcode()) + " (with non-constant indicies)");
+        }
+        APInt offset(DL.getPointerSizeInBits(GEP.getPointerAddressSpace()), 0);
+        if(!GEP.accumulateConstantOffset(DL, offset)) {
+            report_fatal_error("Unable to compute GEP offset.");
+        }
+        if(offset == 0) {
+            return useValue(inst, GEP.getPointerOperand());
+        } else {
+            return std::string("(add.") + std::string(typeSuffix(function->global->module, GEP.getType()))
+                + " " + useValue(inst, GEP.getPointerOperand()) + " " + offset.toString(10, false) + ")";
+        }
+    }
+    default:
+        errs() << "Unsupported instruction " << *inst << "\n";
+        report_fatal_error(std::string("Unsupported instruction ") +
+                           inst->getOpcodeName(inst->getOpcode()));
+    }
+}
+
+static void translateFunction(IotaTranslator *xlat, Function &fn) {
+    IotaFunctionTranslator function_xlat;
+    function_xlat.global = xlat;
+
     outs() << "(define-llvm-function " << escapeSymbol(fn.getName()) << " ((";
-    std::unordered_map<Value*, std::string> name_table;
+    std::unordered_map<Value*, std::string> &name_table = function_xlat.name_table;
     for(auto &arg: fn.args()) {
         std::string name = arg.getName();
         if(name.empty()) {
@@ -446,8 +669,7 @@ static void translateFunction(std::unique_ptr<Module> &module, std::unordered_ma
         name += std::to_string(name_table.size());
         name_table[&bb] = escapeSymbol(name);
     }
-    // Create variables for each instruction.
-    outs() << "  (let (";
+    // Create names for each instruction.
     for(auto &bb: fn) {
         for(auto &inst: bb) {
             auto ty = inst.getType();
@@ -455,9 +677,6 @@ static void translateFunction(std::unique_ptr<Module> &module, std::unordered_ma
                 continue;
             }
             if(inst.use_empty()) {
-                continue;
-            }
-            if(isFusableCmpAndBranchPair(inst)) {
                 continue;
             }
             std::string name = inst.getName();
@@ -468,11 +687,25 @@ static void translateFunction(std::unique_ptr<Module> &module, std::unordered_ma
             }
             name += std::to_string(name_table.size());
             name_table[&inst] = escapeSymbol(name);
-            outs() << "(" << escapeSymbol(name) << " " << clTypeInitializer(ty) << ")\n        ";
+        }
+    }
+    // Create variables for instructions that span basic blocks.
+    outs() << "  (let (";
+    for(auto &bb: fn) {
+        for(auto &inst: bb) {
+            auto ty = inst.getType();
+            if(ty->isVoidTy()) {
+                continue;
+            }
+            std::string &name = name_table[&inst];
             if(isSetjmpCall(inst)) {
                 // Generate a setjmp thunk variable for this instruction.
-                outs() << "(setjmp-thunk." << escapeSymbol(name) << " nil)\n        ";
+                outs() << "(setjmp-thunk." << name << " nil)\n        ";
             }
+            if(!isa<PHINode>(inst) && !inst.isUsedOutsideOfBlock(inst.getParent())) {
+                continue;
+            }
+            outs() << "(" << name << " " << clTypeInitializer(ty) << ")\n        ";
         }
     }
     outs() << ")\n";
@@ -480,7 +713,7 @@ static void translateFunction(std::unique_ptr<Module> &module, std::unordered_ma
         outs() << "    (declare ";
         for(auto &arg: fn.args()) {
             auto ty = arg.getType();
-            outs() << "(type " << clTypeName(ty) << " " << name_table[&arg] << ")\n             ";
+            outs() << "(type " << clTypeName(xlat->module, ty) << " " << name_table[&arg] << ")\n             ";
         }
         for(auto &bb: fn) {
             for(auto &inst: bb) {
@@ -488,13 +721,10 @@ static void translateFunction(std::unique_ptr<Module> &module, std::unordered_ma
                 if(ty->isVoidTy()) {
                     continue;
                 }
-                if(inst.use_empty()) {
+                if(!isa<PHINode>(inst) && !inst.isUsedOutsideOfBlock(inst.getParent())) {
                     continue;
                 }
-                if(isFusableCmpAndBranchPair(inst)) {
-                    continue;
-                }
-                outs() << "(type " << clTypeName(ty) << " " << name_table[&inst] << ")\n             ";
+                outs() << "(type " << clTypeName(xlat->module, ty) << " " << name_table[&inst] << ")\n             ";
             }
         }
         outs() << ")\n";
@@ -509,216 +739,49 @@ static void translateFunction(std::unique_ptr<Module> &module, std::unordered_ma
             }
         }
     }
+
+    // Generate code for each basic block.
     for(auto &bb: fn) {
         outs() << "       " << name_table[&bb] << "\n";
-        bool skip_next = false;
+        IotaBlockTranslator block_xlat;
+        block_xlat.function = &function_xlat;
         for(auto &inst: bb) {
-            if(PrintLLVMInstructions) {
-                outs() << "        #| " << inst << "|#\n";
-            }
-            if(skip_next) {
-                skip_next = false;
-                continue;
-            }
-            if(inst.getType()->isVoidTy() ||
-               isFusableCmpAndBranchPair(inst) ||
-               inst.use_empty() ||
-               isSetjmpCall(inst)) {
-                outs() << "        ";
-            } else if(isa<PHINode>(inst)) {
-            } else {
-                outs() << "        (setq " << name_table[&inst] << " ";
-            }
-            switch(inst.getOpcode()) {
-            case Instruction::Alloca: {
-                AllocaInst &AI = cast<AllocaInst>(inst);
-                if(!AI.isStaticAlloca()) {
-                    report_fatal_error("Non-static alloca");
-                }
-                auto size = cast<ConstantInt>(AI.getArraySize());
-                outs() << "(alloca " << (size->getZExtValue() * DL.getTypeAllocSize(AI.getAllocatedType())) << ")";
-                break;
-            }
-                // These are no-op casts.
-            case Instruction::PtrToInt:
-            case Instruction::IntToPtr: {
-                outs() << valueForPrinting(module, name_table, global_table, inst.getOperand(0));
-                break;
-            }
-            case Instruction::Add:
-            case Instruction::FAdd:
-            case Instruction::Sub:
-            case Instruction::FSub:
-            case Instruction::Mul:
-            case Instruction::FMul:
-            case Instruction::UDiv:
-            case Instruction::SDiv:
-            case Instruction::FDiv:
-            case Instruction::URem:
-            case Instruction::SRem:
-            case Instruction::FRem:
-            case Instruction::Shl:
-            case Instruction::LShr:
-            case Instruction::AShr:
-            case Instruction::And:
-            case Instruction::Or:
-            case Instruction::Xor: {
-                outs() << "(" << inst.getOpcodeName(inst.getOpcode()) << "." << typeSuffix(module, inst.getType())
-                       << " " << valueForPrinting(module, name_table, global_table, inst.getOperand(0))
-                       << " " << valueForPrinting(module, name_table, global_table, inst.getOperand(1)) << ")";
-                break;
-            }
-            case Instruction::BitCast:
-            case Instruction::Trunc:
-            case Instruction::ZExt:
-            case Instruction::SExt:
-            case Instruction::FPToUI:
-            case Instruction::FPToSI:
-            case Instruction::UIToFP:
-            case Instruction::SIToFP:
-            case Instruction::FPTrunc:
-            case Instruction::FPExt: {
-                outs() << "(" << inst.getOpcodeName(inst.getOpcode()) << "." << typeSuffix(module, inst.getOperand(0)->getType()) << "." << typeSuffix(module, inst.getType())
-                       << " " << valueForPrinting(module, name_table, global_table, inst.getOperand(0)) << ")";
-                break;
-            }
-            case Instruction::ICmp:
-            case Instruction::FCmp: {
-                auto &CI = cast<CmpInst>(inst);
-                if(isFusableCmpAndBranchPair(inst)) {
-                    skip_next = true;
-                    auto B = cast<BranchInst>(nextInstruction(&CI));
-                    outs() << "(if (" << inst.getOpcodeName(CI.getOpcode()) << "." << getPredicateText(CI.getPredicate()) << ".fused" << "." << typeSuffix(module, CI.getOperand(0)->getType())
-                           << " " << valueForPrinting(module, name_table, global_table, CI.getOperand(0))
-                           << " " << valueForPrinting(module, name_table, global_table, CI.getOperand(1)) << ")\n";
-                    outs() << "            (progn\n";
-                    prepareForBranch(module, name_table, global_table, &bb, B->getSuccessor(0), "              ");
-                    outs() << "              (go " << name_table[B->getSuccessor(0)] << "))\n";
-                    outs() << "            (progn\n";
-                    prepareForBranch(module, name_table, global_table, &bb, B->getSuccessor(1), "              ");
-                    outs() << "              (go " << name_table[B->getSuccessor(1)] << ")))";
-                } else {
-                    outs() << "(" << inst.getOpcodeName(CI.getOpcode()) << "." << getPredicateText(CI.getPredicate()) << "." << typeSuffix(module, CI.getOperand(0)->getType())
-                           << " " << valueForPrinting(module, name_table, global_table, CI.getOperand(0))
-                           << " " << valueForPrinting(module, name_table, global_table, CI.getOperand(1)) << ")";
-                }
-                break;
-            }
-            case Instruction::Load:
-                outs() << "(load." << typeSuffix(module, inst.getType())
-                       << " " << valueForPrinting(module, name_table, global_table, inst.getOperand(0)) << ")";
-                break;
-            case Instruction::Store:
-                outs() << "(store." << typeSuffix(module, inst.getOperand(0)->getType())
-                       << " " << valueForPrinting(module, name_table, global_table, inst.getOperand(0))
-                       << " " << valueForPrinting(module, name_table, global_table, inst.getOperand(1)) << ")";
-                break;
-            case Instruction::PHI:
-                break;
-            case Instruction::Br: {
-                auto &B = cast<BranchInst>(inst);
-                if(B.isConditional()) {
-                    outs() << "(if (not (eql " << valueForPrinting(module, name_table, global_table, B.getCondition()) << " 0))\n";
-                    outs() << "            (progn\n";
-                    prepareForBranch(module, name_table, global_table, &bb, B.getSuccessor(0), "              ");
-                    outs() << "              (go " << name_table[B.getSuccessor(0)] << "))\n";
-                    outs() << "            (progn\n";
-                    prepareForBranch(module, name_table, global_table, &bb, B.getSuccessor(1), "              ");
-                    outs() << "              (go " << name_table[B.getSuccessor(1)] << ")))";
-                } else {
-                    prepareForBranch(module, name_table, global_table, &bb, B.getSuccessor(0), "");
-                    if(isa<PHINode>(B.getSuccessor(0)->front())) {
-                        outs() << "        ";
-                    }
-                    outs() << "(go " << name_table[B.getSuccessor(0)] << ")";
-                }
-                break;
-            }
-            case Instruction::Ret: {
-                auto &ret = cast<ReturnInst>(inst);
-                auto val = ret.getReturnValue();
-                if(val) {
-                    outs() << "(return " << valueForPrinting(module, name_table, global_table, val) << ")";
-                } else {
-                    outs() << "(return)";
-                }
-                break;
-            }
-            case Instruction::Unreachable: {
-                outs() << "(error \"Reached unreachable!\")";
-                break;
-            }
-            case Instruction::Call: {
-                auto &call = cast<CallInst>(inst);
-                if(call.isInlineAsm()) {
-                    errs() << "Unsupported instruction " << inst << "\n";
-                    report_fatal_error("Inline asm? You must be joking!");
-                }
-                if(isSetjmpCall(inst)) {
-                    outs() << "(call-direct " << escapeSymbol(call.getCalledFunction()->getName()) << " setjmp-thunk." << name_table[&inst];
-                    for(auto &operand: call.arg_operands()) {
-                        outs() << " " << valueForPrinting(module, name_table, global_table, operand);
-                    }
-                    outs() << ")\n";
-                    outs() << "        (setq " << name_table[&inst] << " 0)\n";
-                    outs() << "        (go setjmp-resume." << name_table[&inst] << ")\n";
-                    outs() << "      setjmp-target." << name_table[&inst] << "\n";
-                    outs() << "        (setq " << name_table[&inst] << " 1)\n";
-                    outs() << "        (go setjmp-resume." << name_table[&inst] << ")\n";
-                    outs() << "      setjmp-resume." << name_table[&inst] << "\n";
-                } else if(auto target = call.getCalledFunction()) {
-                    outs() << "(call-direct " << escapeSymbol(target->getName());
-                    for(auto &operand: call.arg_operands()) {
-                        outs() << " " << valueForPrinting(module, name_table, global_table, operand);
-                    }
-                    outs() << ")";
-                } else {
-                    outs() << "(call-indirect " << valueForPrinting(module, name_table, global_table, call.getCalledValue());
-                    for(auto &operand: call.arg_operands()) {
-                        outs() << " " << valueForPrinting(module, name_table, global_table, operand);
-                    }
-                    outs() << ")";
-                }
-                break;
-            }
-            case Instruction::Select: {
-                auto &select = cast<SelectInst>(inst);
-                outs() << "(select " << valueForPrinting(module, name_table, global_table, select.getCondition());
-                outs() << " " << valueForPrinting(module, name_table, global_table, select.getTrueValue());
-                outs() << " " << valueForPrinting(module, name_table, global_table, select.getFalseValue()) << ")";
-                break;
-            }
-            case Instruction::GetElementPtr: {
-                auto &GEP = cast<GetElementPtrInst>(inst);
-                if(!GEP.hasAllConstantIndices()) {
-                    errs() << "Unsupported instruction " << inst << "\n";
-                    report_fatal_error(std::string("Unsupported instruction ") +
-                                       inst.getOpcodeName(inst.getOpcode()) + " (with non-constant indicies)");
-                }
-                APInt offset(DL.getPointerSizeInBits(GEP.getPointerAddressSpace()), 0);
-                if(!GEP.accumulateConstantOffset(DL, offset)) {
-                    report_fatal_error("Unable to compute GEP offset.");
-                }
-                outs() << "(add." << typeSuffix(module, GEP.getType())
-                       << " " << valueForPrinting(module, name_table, global_table, GEP.getPointerOperand())
-                       << " " << offset << ")";
-                break;
-            }
-            default:
-                errs() << "Unsupported instruction " << inst << "\n";
-                report_fatal_error(std::string("Unsupported instruction ") +
-                                   inst.getOpcodeName(inst.getOpcode()));
-            }
-            if(inst.getType()->isVoidTy() ||
-               isFusableCmpAndBranchPair(inst) ||
-               inst.use_empty() ||
-               isSetjmpCall(inst)) {
-                outs() << "\n";
-            } else if(isa<PHINode>(inst)) {
-            } else {
-                outs() << ")\n";
+            if(!isa<PHINode>(inst)) {
+                block_xlat.remaining.push_back(&inst);
             }
         }
+        std::vector<std::pair<Instruction *, std::string>> entries;
+        // Working backwards.
+        while(!block_xlat.remaining.empty()) {
+            auto inst = block_xlat.remaining.back();
+            block_xlat.remaining.pop_back();
+            entries.push_back(std::make_pair(inst, block_xlat.translateInstruction(inst)));
+        }
+        // Work backwards again to emit them in the right order.
+        std::string close_parens = "";
+        while(!entries.empty()) {
+            auto entry = entries.back();
+            entries.pop_back();
+            auto inst = entry.first;
+            auto code = entry.second;
+            if(inst->getType()->isVoidTy() ||
+               inst->use_empty() ||
+               isSetjmpCall(*inst)) {
+                // nothing - result not used.
+                outs() << "         " << code << "\n";
+            } else if(inst->isUsedOutsideOfBlock(inst->getParent())) {
+                // Not local to the basic block
+                outs() << "         " << "(setf " << name_table[inst] << " " << code << ")\n";
+            } else {
+                // Local to the basic block.
+                outs() << "         " << "(let ((" << name_table[inst] << " " << code << "))\n";
+                if(EmitTypeDeclarartions) {
+                    outs() << "         " << "    (declare (type " << clTypeName(xlat->module, inst->getType()) << " " << name_table[inst] << "))\n";
+                }
+                close_parens += ")";
+            }
+        }
+        outs() << close_parens << "\n";
     }
     outs() << "))))\n\n";
 }
@@ -730,11 +793,14 @@ static void storeInteger(std::vector<uint8_t> &data_section, uint64_t offset, ui
         data_section[offset+6] = value >> 48;
         data_section[offset+5] = value >> 40;
         data_section[offset+4] = value >> 32;
+        [[gnu::fallthrough]];
     case 32:
         data_section[offset+3] = value >> 24;
         data_section[offset+2] = value >> 16;
+        [[gnu::fallthrough]];
     case 16:
         data_section[offset+1] = value >> 8;
+        [[gnu::fallthrough]];
     case 8:
         data_section[offset+0] = value;
         break;
@@ -774,7 +840,7 @@ static void storeGlobalConstant(std::unique_ptr<Module> &module, std::unordered_
     } else if(isa<ConstantAggregateZero>(value) || isa<UndefValue>(value)) {
         /* Nuthin' at all */
     } else {
-        uint64_t numeric_value = resolveConstantInteger(module, global_table, value);
+        uint64_t numeric_value = resolveConstantInteger(&*module, global_table, value);
         storeInteger(data_section, offset, numeric_value,
                      module->getDataLayout().getTypeStoreSizeInBits(value->getType()));
     }
@@ -811,8 +877,12 @@ int main(int argc, char **argv) {
         legacy::PassManager PM;
 
         // Internalize all symbols in the module except the entry point.
-        const char *export_name = EntryPoint.c_str();
-        PM.add(createInternalizePass(export_name));
+        if(LibraryMode) {
+            PM.add(createInternalizePass());
+        } else {
+            const char *export_name = EntryPoint.c_str();
+            PM.add(createInternalizePass(export_name));
+        }
 
         // Simplification passes.
         PM.add(createExpandVarArgsPass());
@@ -837,11 +907,14 @@ int main(int argc, char **argv) {
         PM2.run(*module);
     }
 
+    IotaTranslator xlat;
+    xlat.module = &*module;
+
     unsigned long long data_origin = 0x200000;
     unsigned long long data_end = data_origin;
     unsigned long long next_fn_id = 1;
     // Lay out the data section.
-    std::unordered_map<GlobalObject *, unsigned long long> global_table;
+    std::unordered_map<GlobalObject *, unsigned long long> &global_table = xlat.global_table;
     for(auto &glob: module->globals()) {
         if(!glob.hasInitializer()) {
             report_fatal_error("Global " + glob.getName() + " is uninitialized");
@@ -903,7 +976,11 @@ int main(int argc, char **argv) {
         outs() << escapeSymbol(function_table[i]->getName());
     }
     outs() << ")\n";
-    outs() << "   '" << escapeSymbol(EntryPoint) << "\n";
+    if(LibraryMode && EntryPoint == "_start") {
+        outs() << "   nil\n";
+    } else {
+        outs() << "   '" << escapeSymbol(EntryPoint) << "\n";
+    }
     outs() << "   personality-initargs))\n\n";
 
     errs() << "Undefined functions:\n";
@@ -930,7 +1007,7 @@ int main(int argc, char **argv) {
         if(!fn.empty() && !fn.isDefTriviallyDead()) {
             errs() << functions_translated << ": Translating function " << fn.getName() << "\n";
             functions_translated += 1;
-            translateFunction(module, global_table, fn);
+            translateFunction(&xlat, fn);
         }
     }
 }
