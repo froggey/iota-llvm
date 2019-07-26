@@ -36,6 +36,7 @@ using namespace llvm;
 
 extern void lowerBitcastTrunc(Module &M);
 extern void lowerVectorBswap(Module &M);
+extern void eliminateLifetimeIntrinsics(Module &M);
 
 static cl::opt<std::string>
 InputFilename(cl::Positional, cl::desc("<input file>"), cl::Required);
@@ -827,6 +828,7 @@ int main(int argc, char **argv) {
         PM.run(*module);
 
         lowerBitcastTrunc(*module);
+        eliminateLifetimeIntrinsics(*module);
 
         legacy::PassManager PM2;
         PM2.add(createInstructionCombiningPass());

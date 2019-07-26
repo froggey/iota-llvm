@@ -15,4 +15,5 @@ add_llvm_tool(iota
   iota.cpp
   LowerBitcastTrunc.cpp
   LowerVectorBswap.cpp
+  EliminateLifetimeIntrinsics.cpp
   )
