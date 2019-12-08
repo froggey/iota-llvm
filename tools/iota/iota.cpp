@@ -31,6 +31,8 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ToolOutputFile.h"
 #include <unordered_map>
 
 using namespace llvm;
@@ -65,6 +67,10 @@ TranslateOnly("translate-only", cl::desc("Only translate input, do not run addit
 static cl::opt<bool>
 LibraryMode("library-mode", cl::desc("Don't export _start, only symbols specified with -internalize-public-api-file or -internalize-public-api-list"));
 
+static cl::opt<std::string>
+OutputFilename("o", cl::desc("Override output filename"),
+               cl::value_desc("filename"));
+
 class IotaTranslator {
 public:
     Module *module;
@@ -78,7 +84,7 @@ public:
     DominatorTree dom;
 
     StringRef valueForPrinting(Value *value);
-    void translateBlock(BasicBlock &bb);
+    void translateBlock(BasicBlock &bb, std::unique_ptr<tool_output_file> &Out);
 };
 
 class IotaBlockTranslator {
@@ -615,7 +621,7 @@ std::string IotaBlockTranslator::translateInstruction(Instruction *inst) {
     }
 }
 
-void IotaFunctionTranslator::translateBlock(BasicBlock &bb) {
+void IotaFunctionTranslator::translateBlock(BasicBlock &bb, std::unique_ptr<tool_output_file> &Out) {
     IotaBlockTranslator block_xlat;
     block_xlat.function = this;
     for(auto &inst: bb) {
@@ -643,40 +649,40 @@ void IotaFunctionTranslator::translateBlock(BasicBlock &bb) {
             if(in_let) {
                 // Close up the current LET*
                 close_parens += ")";
-                outs() << ")\n         " << "(declare ";
+                Out->os() << ")\n         " << "(declare ";
                 for(auto &decl: pending_type_decls) {
-                    outs() << decl << "\n";
+                    Out->os() << decl << "\n";
                 }
-                outs() << ")\n";
+                Out->os() << ")\n";
                 pending_type_decls.clear();
                 in_let = false;
             }
             auto &call = cast<CallInst>(*inst);
-            outs() << "(tagbody\n";
+            Out->os() << "(tagbody\n";
             // Generate a setjmp thunk variable for this instruction.
-            outs() << "        (setf setjmp-thunk." << name_table[inst] << " (setjmp.prepare setjmp-target." << name_table[inst] << "))\n";
-            outs() << "(call-direct " << escapeSymbol(call.getCalledFunction()->getName()) << " setjmp-thunk." + name_table[inst];
+            Out->os() << "        (setf setjmp-thunk." << name_table[inst] << " (setjmp.prepare setjmp-target." << name_table[inst] << "))\n";
+            Out->os() << "(call-direct " << escapeSymbol(call.getCalledFunction()->getName()) << " setjmp-thunk." + name_table[inst];
             for(auto &operand: call.arg_operands()) {
-                outs() << " " << valueForPrinting(operand);
+                Out->os() << " " << valueForPrinting(operand);
             }
-            outs() << ")\n";
-            outs() << "        (setq " << name_table[inst] << " 0)\n";
-            outs() << "        (go setjmp-resume." << name_table[inst] << ")\n";
-            outs() << "      setjmp-target." << name_table[inst] << "\n";
-            outs() << "        (setq " << name_table[inst] << " 1)\n";
-            outs() << "        (go setjmp-resume." << name_table[inst] << ")\n";
-            outs() << "      setjmp-resume." << name_table[inst] << "\n";
+            Out->os() << ")\n";
+            Out->os() << "        (setq " << name_table[inst] << " 0)\n";
+            Out->os() << "        (go setjmp-resume." << name_table[inst] << ")\n";
+            Out->os() << "      setjmp-target." << name_table[inst] << "\n";
+            Out->os() << "        (setq " << name_table[inst] << " 1)\n";
+            Out->os() << "        (go setjmp-resume." << name_table[inst] << ")\n";
+            Out->os() << "      setjmp-resume." << name_table[inst] << "\n";
             close_parens += ")"; // close up the tagbody.
         } else if(inst->getType()->isVoidTy() ||
                   inst->use_empty()) {
             if(in_let) {
                 // Close up the current LET*
                 close_parens += ")";
-                outs() << ")\n         " << "(declare ";
+                Out->os() << ")\n         " << "(declare ";
                 for(auto &decl: pending_type_decls) {
-                    outs() << decl << "\n";
+                    Out->os() << decl << "\n";
                 }
-                outs() << ")\n";
+                Out->os() << ")\n";
                 pending_type_decls.clear();
                 in_let = false;
             }
@@ -685,17 +691,17 @@ void IotaFunctionTranslator::translateBlock(BasicBlock &bb) {
                 // Any blocks that this block immediately dominates will be emitted after
                 // it, but in a tagbody with the right scope. Emit the tagbody here
                 // so labels are visible.
-                outs() << "(tagbody\n";
+                Out->os() << "(tagbody\n";
                 close_parens += ")";
             }
             // nothing - result not used.
-            outs() << "         " << code << "\n";
+            Out->os() << "         " << code << "\n";
         } else {
             // Local to the basic block and its children in the dominator tree.
             if(in_let) {
-                outs() << "\n         " << "       (" << name_table[inst] << " " << code << ")";
+                Out->os() << "\n         " << "       (" << name_table[inst] << " " << code << ")";
             } else {
-                outs() << "         " << "(let* ((" << name_table[inst] << " " << code << ")";
+                Out->os() << "         " << "(let* ((" << name_table[inst] << " " << code << ")";
                 in_let = true;
             }
             if(EmitTypeDeclarartions) {
@@ -707,20 +713,20 @@ void IotaFunctionTranslator::translateBlock(BasicBlock &bb) {
     // TODO: Be more clever about this. BR could be changed to emit the block inline if it one has one predecessor
     // and the BR dominates the target.
     for(auto &child: *dom[&bb]) {
-        outs() << "       " << name_table[child->getBlock()] << "\n";
-        translateBlock(*child->getBlock());
+        Out->os() << "       " << name_table[child->getBlock()] << "\n";
+        translateBlock(*child->getBlock(), Out);
     }
     if(!close_parens.empty()) {
-        outs() << close_parens << "\n";
+        Out->os() << close_parens << "\n";
     }
 }
 
-static void translateFunction(IotaTranslator *xlat, Function &fn) {
+static void translateFunction(IotaTranslator *xlat, Function &fn, std::unique_ptr<tool_output_file> &Out) {
     IotaFunctionTranslator function_xlat;
     function_xlat.global = xlat;
     function_xlat.dom = DominatorTreeAnalysis().run(fn);
 
-    outs() << "(define-llvm-function " << escapeSymbol(fn.getName()) << " ((";
+    Out->os() << "(define-llvm-function " << escapeSymbol(fn.getName()) << " ((";
     std::unordered_map<Value*, std::string> &name_table = function_xlat.name_table;
     for(auto &arg: fn.args()) {
         std::string name = arg.getName();
@@ -731,9 +737,9 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
         }
         name += std::to_string(name_table.size());
         name_table[&arg] = escapeSymbol(name);
-        outs() << escapeSymbol(name) << " ";
+        Out->os() << escapeSymbol(name) << " ";
     }
-    outs() << ")";
+    Out->os() << ")";
     bool need_frame_pointer = false;
     for(auto &inst: fn.getEntryBlock()) {
         if(isa<AllocaInst>(inst)) {
@@ -741,13 +747,13 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
             break;
         }
     }
-    outs() << " :need-frame-pointer " << (need_frame_pointer ? "t" : "nil");
+    Out->os() << " :need-frame-pointer " << (need_frame_pointer ? "t" : "nil");
     if(fn.callsFunctionThatReturnsTwice()) {
-        outs() << " :uses-setjmp t";
+        Out->os() << " :uses-setjmp t";
     }
-    outs() << ")\n";
+    Out->os() << ")\n";
     if(!OptimizeQualities.empty()) {
-        outs() << "  (declare (optimize " << OptimizeQualities << "))\n";
+        Out->os() << "  (declare (optimize " << OptimizeQualities << "))\n";
     }
     // Create names for each basic block.
     for(auto &bb: fn) {
@@ -781,7 +787,7 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
         }
     }
     // Create variables for PHINodes.
-    outs() << "  (let (";
+    Out->os() << "  (let (";
     for(auto &bb: fn) {
         for(auto &inst: bb) {
             auto ty = inst.getType();
@@ -792,21 +798,21 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
             if(isSetjmpCall(inst)) {
                 // Generate a setjmp thunk variable for this instruction.
                 // And also the variable to hold the setjmp result
-                outs() << "(setjmp-thunk." << name << " nil)\n        ";
-                outs() << "(" << name << " nil)\n        ";
+                Out->os() << "(setjmp-thunk." << name << " nil)\n        ";
+                Out->os() << "(" << name << " nil)\n        ";
             }
             if(!isa<PHINode>(inst)) {
                 continue;
             }
-            outs() << "(" << name << " " << clTypeInitializer(ty) << ")\n        ";
+            Out->os() << "(" << name << " " << clTypeInitializer(ty) << ")\n        ";
         }
     }
-    outs() << ")\n";
+    Out->os() << ")\n";
     if(EmitTypeDeclarartions) {
-        outs() << "    (declare ";
+        Out->os() << "    (declare ";
         for(auto &arg: fn.args()) {
             auto ty = arg.getType();
-            outs() << "(type " << clTypeName(xlat->module, ty) << " " << name_table[&arg] << ")\n             ";
+            Out->os() << "(type " << clTypeName(xlat->module, ty) << " " << name_table[&arg] << ")\n             ";
         }
         for(auto &bb: fn) {
             for(auto &inst: bb) {
@@ -817,21 +823,21 @@ static void translateFunction(IotaTranslator *xlat, Function &fn) {
                 if(!isa<PHINode>(inst)) {
                     continue;
                 }
-                outs() << "(type " << clTypeName(xlat->module, ty) << " " << name_table[&inst] << ")\n             ";
+                Out->os() << "(type " << clTypeName(xlat->module, ty) << " " << name_table[&inst] << ")\n             ";
             }
         }
-        outs() << ")\n";
+        Out->os() << ")\n";
     }
-    outs() << "    (block nil\n";
-    outs() << "      (tagbody\n";
+    Out->os() << "    (block nil\n";
+    Out->os() << "      (tagbody\n";
     // Generate code for each basic block.
     // Traverse the dominator tree to get nesting right.
     // TODO: This does not work right for particularly perverse uses of setjmp,
     // where the call to setjmp does not dominate all calls to longjmp.
     // These kinds of uses will manifest as GOs to expired GO tags.
     // FIXME: Can instructions jump to the entry block? Don't think so...
-    function_xlat.translateBlock(fn.getEntryBlock());
-    outs() << "))))\n\n";
+    function_xlat.translateBlock(fn.getEntryBlock(), Out);
+    Out->os() << "))))\n\n";
 }
 
 static void storeInteger(std::vector<uint8_t> &data_section, uint64_t offset, uint64_t value, int width) {
@@ -894,6 +900,112 @@ static void storeGlobalConstant(std::unique_ptr<Module> &module, std::unordered_
     }
 }
 
+static void iotaTranslate(std::unique_ptr<Module> &module, std::unique_ptr<tool_output_file> &Out) {
+    IotaTranslator xlat;
+    xlat.module = &*module;
+
+    unsigned long long data_origin = 0x200000;
+    unsigned long long data_end = data_origin;
+    unsigned long long next_fn_id = 1;
+    // Lay out the data section.
+    std::unordered_map<GlobalObject *, unsigned long long> &global_table = xlat.global_table;
+    for(auto &glob: module->globals()) {
+        if(!glob.hasInitializer()) {
+            report_fatal_error("Global " + glob.getName() + " is uninitialized");
+        }
+        global_table[&glob] = data_end;
+        data_end += module->getDataLayout().getTypeAllocSize(glob.getInitializer()->getType());
+        // Round to 16 byte boundary.
+        data_end += 15;
+        data_end &= ~15ull;
+    }
+    // Lay out the function table.
+    std::vector<Function *> function_table;
+    for(auto &fn: module->functions()) {
+        if(!fn.hasAddressTaken()) {
+            continue;
+        }
+        function_table.push_back(&fn);
+        global_table[&fn] = next_fn_id;
+        next_fn_id += 1;
+    }
+    // Initialize the data section.
+    std::vector<uint8_t> data_section;
+    data_section.resize(data_end - data_origin, 0);
+    for(auto &glob: module->globals()) {
+        auto offset = global_table[&glob] - data_origin;
+        storeGlobalConstant(module, global_table, data_section, offset, glob.getInitializer());
+    }
+
+    if(!PackageName.empty()) {
+        Out->os() << "(in-package " << PackageName << ")\n\n";
+    }
+
+    Out->os() << "(defun make-context (&rest personality-initargs)\n";
+    Out->os() << "  (make-llvm-context\n";
+    if(ContextPersonality.empty()) {
+        Out->os() << "   :unix\n";
+    } else {
+        Out->os() << "   '" << ContextPersonality << "\n";
+    }
+    Out->os() << "   " << data_origin << "\n";
+    Out->os() << "   #.(make-array " << (data_end - data_origin) << " :element-type '(unsigned-byte 8) :initial-contents '(";
+    for(size_t i = 0; i < data_section.size(); i += 1) {
+        if((i % 64) == 0) {
+            Out->os() << "\n     ";
+        } else {
+            Out->os() << " ";
+        }
+        Out->os() << (int)data_section[i];
+    }
+    Out->os() << "))\n";
+    Out->os() << "   " << (module->getDataLayout().getPointerSizeInBits(0) == 32 ? "t" : "nil") << "\n";
+    Out->os() << "   #(";
+    for(size_t i = 0; i < function_table.size(); i += 1) {
+        if((i % 64) == 0) {
+            Out->os() << "\n     ";
+        } else {
+            Out->os() << " ";
+        }
+        Out->os() << escapeSymbol(function_table[i]->getName());
+    }
+    Out->os() << ")\n";
+    if(LibraryMode && EntryPoint == "_start") {
+        Out->os() << "   nil\n";
+    } else {
+        Out->os() << "   '" << escapeSymbol(EntryPoint) << "\n";
+    }
+    Out->os() << "   personality-initargs))\n\n";
+
+    errs() << "Undefined functions:\n";
+    for(auto &fn: module->functions()) {
+        if(fn.empty()) {
+            errs() << fn.getName() << "\n";
+        }
+    }
+
+    unsigned functions_to_translate = 0;
+    for(auto &fn: module->functions()) {
+        if(!fn.empty() && !fn.isDefTriviallyDead()) {
+            functions_to_translate += 1;
+        }
+    }
+    errs() << functions_to_translate << " functions to translate\n";
+
+    // Translate all functions.
+    unsigned functions_translated = 0;
+    for(auto &fn: module->functions()) {
+        if(fn.isVarArg()) {
+            report_fatal_error("Function " + fn.getName() + " is vararg");
+        }
+        if(!fn.empty() && !fn.isDefTriviallyDead()) {
+            errs() << functions_translated << ": Translating function " << fn.getName() << "\n";
+            functions_translated += 1;
+            translateFunction(&xlat, fn, Out);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     sys::PrintStackTraceOnErrorSignal();
     PrettyStackTraceProgram X(argc, argv);
@@ -909,6 +1021,18 @@ int main(int argc, char **argv) {
 
     cl::ParseCommandLineOptions(modified_args.size(), &modified_args[0],
                                 "Iota LLVM -> CL transpiler\n");
+
+    if (OutputFilename.empty()) {
+        OutputFilename = "-";
+    }
+
+    std::error_code EC;
+    std::unique_ptr<tool_output_file> Out(
+        new tool_output_file(OutputFilename, EC, sys::fs::F_None));
+    if (EC) {
+      errs() << EC.message() << '\n';
+      return -1;
+    }
 
     LLVMContext context;
     SMDiagnostic err;
@@ -955,107 +1079,9 @@ int main(int argc, char **argv) {
         PM2.run(*module);
     }
 
-    IotaTranslator xlat;
-    xlat.module = &*module;
+    iotaTranslate(module, Out);
+    Out->keep();
+    Out->os().close();
 
-    unsigned long long data_origin = 0x200000;
-    unsigned long long data_end = data_origin;
-    unsigned long long next_fn_id = 1;
-    // Lay out the data section.
-    std::unordered_map<GlobalObject *, unsigned long long> &global_table = xlat.global_table;
-    for(auto &glob: module->globals()) {
-        if(!glob.hasInitializer()) {
-            report_fatal_error("Global " + glob.getName() + " is uninitialized");
-        }
-        global_table[&glob] = data_end;
-        data_end += module->getDataLayout().getTypeAllocSize(glob.getInitializer()->getType());
-        // Round to 16 byte boundary.
-        data_end += 15;
-        data_end &= ~15ull;
-    }
-    // Lay out the function table.
-    std::vector<Function *> function_table;
-    for(auto &fn: module->functions()) {
-        if(!fn.hasAddressTaken()) {
-            continue;
-        }
-        function_table.push_back(&fn);
-        global_table[&fn] = next_fn_id;
-        next_fn_id += 1;
-    }
-    // Initialize the data section.
-    std::vector<uint8_t> data_section;
-    data_section.resize(data_end - data_origin, 0);
-    for(auto &glob: module->globals()) {
-        auto offset = global_table[&glob] - data_origin;
-        storeGlobalConstant(module, global_table, data_section, offset, glob.getInitializer());
-    }
-
-    if(!PackageName.empty()) {
-        outs() << "(in-package " << PackageName << ")\n\n";
-    }
-
-    outs() << "(defun make-context (&rest personality-initargs)\n";
-    outs() << "  (make-llvm-context\n";
-    if(ContextPersonality.empty()) {
-        outs() << "   :unix\n";
-    } else {
-        outs() << "   '" << ContextPersonality << "\n";
-    }
-    outs() << "   " << data_origin << "\n";
-    outs() << "   #.(make-array " << (data_end - data_origin) << " :element-type '(unsigned-byte 8) :initial-contents '(";
-    for(size_t i = 0; i < data_section.size(); i += 1) {
-        if((i % 64) == 0) {
-            outs() << "\n     ";
-        } else {
-            outs() << " ";
-        }
-        outs() << (int)data_section[i];
-    }
-    outs() << "))\n";
-    outs() << "   " << (module->getDataLayout().getPointerSizeInBits(0) == 32 ? "t" : "nil") << "\n";
-    outs() << "   #(";
-    for(size_t i = 0; i < function_table.size(); i += 1) {
-        if((i % 64) == 0) {
-            outs() << "\n     ";
-        } else {
-            outs() << " ";
-        }
-        outs() << escapeSymbol(function_table[i]->getName());
-    }
-    outs() << ")\n";
-    if(LibraryMode && EntryPoint == "_start") {
-        outs() << "   nil\n";
-    } else {
-        outs() << "   '" << escapeSymbol(EntryPoint) << "\n";
-    }
-    outs() << "   personality-initargs))\n\n";
-
-    errs() << "Undefined functions:\n";
-    for(auto &fn: module->functions()) {
-        if(fn.empty()) {
-            errs() << fn.getName() << "\n";
-        }
-    }
-
-    unsigned functions_to_translate = 0;
-    for(auto &fn: module->functions()) {
-        if(!fn.empty() && !fn.isDefTriviallyDead()) {
-            functions_to_translate += 1;
-        }
-    }
-    errs() << functions_to_translate << " functions to translate\n";
-
-    // Translate all functions.
-    unsigned functions_translated = 0;
-    for(auto &fn: module->functions()) {
-        if(fn.isVarArg()) {
-            report_fatal_error("Function " + fn.getName() + " is vararg");
-        }
-        if(!fn.empty() && !fn.isDefTriviallyDead()) {
-            errs() << functions_translated << ": Translating function " << fn.getName() << "\n";
-            functions_translated += 1;
-            translateFunction(&xlat, fn);
-        }
-    }
+    return 0;
 }
