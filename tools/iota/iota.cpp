@@ -84,6 +84,9 @@ static cl::opt<std::string>
 OutputFilename("o", cl::desc("Override output filename"),
                cl::value_desc("filename"));
 
+static cl::opt<bool>
+Verbose("v", cl::desc("Print information about actions taken"));
+
 class IotaTranslator {
 public:
     Module *module;
@@ -1003,7 +1006,9 @@ static void iotaTranslate(std::unique_ptr<Module> &module, std::unique_ptr<tool_
             functions_to_translate += 1;
         }
     }
-    errs() << functions_to_translate << " functions to translate\n";
+    if (Verbose) {
+        errs() << functions_to_translate << " functions to translate\n";
+    }
 
     // Translate all functions.
     unsigned functions_translated = 0;
@@ -1012,7 +1017,9 @@ static void iotaTranslate(std::unique_ptr<Module> &module, std::unique_ptr<tool_
             report_fatal_error("Function " + fn.getName() + " is vararg");
         }
         if(!fn.empty() && !fn.isDefTriviallyDead()) {
-            errs() << functions_translated << ": Translating function " << fn.getName() << "\n";
+            if (Verbose) {
+                errs() << functions_translated << ": Translating function " << fn.getName() << "\n";
+            }
             functions_translated += 1;
             translateFunction(&xlat, fn, Out);
         }
@@ -1064,6 +1071,9 @@ static bool readInputFile(StringRef Path, LLVMContext *Context, Linker *L) {
     object::Binary &Bin = *BinaryOrErr.get().getBinary();
 
     if (object::IRObjectFile *IR = dyn_cast<object::IRObjectFile>(&Bin)) {
+        if (Verbose) {
+            errs() << "Loading bitcode file " << Path << "\n";
+        }
         auto &M = IR->getModule();
         if (verifyModule(M, &errs())) {
             errs() << Path << ": error: input module is broken!\n";
@@ -1073,7 +1083,13 @@ static bool readInputFile(StringRef Path, LLVMContext *Context, Linker *L) {
         if (L->linkInModule(&M))
             return false;
     } else if (object::Archive *Archive = dyn_cast<object::Archive>(&Bin)) {
+        if (Verbose) {
+            errs() << "Loading archive " << Path << "\n";
+        }
         for(auto &ArchiveChild: Archive->children()) {
+            if (Verbose) {
+                errs() << "   " << ArchiveChild.getRawName() << "\n";
+            }
             auto ChildOrErr = ArchiveChild.getAsBinary(Context);
             if (std::error_code ec = ChildOrErr.getError()) {
                 errs() << Path << ": " << ArchiveChild.getRawName() << ": "
