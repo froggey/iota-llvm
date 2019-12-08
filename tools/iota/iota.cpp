@@ -40,6 +40,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/LineIterator.h"
+#include "llvm/ADT/StringSet.h"
 #include <unordered_map>
 
 using namespace llvm;
@@ -56,6 +58,9 @@ LibrarySearchPaths("L", cl::desc("Library search paths"), cl::ZeroOrMore, cl::Pr
 
 static cl::list<std::string>
 InputLibraries("l", cl::desc("Libraries to link"), cl::ZeroOrMore, cl::Prefix);
+
+static cl::list<std::string>
+ProvidedSymbolFiles("provided-symbols", cl::desc("File containing a list of defined symbols"), cl::ZeroOrMore);
 
 static cl::opt<bool>
 EmitTypeDeclarartions("emit-type-declarations", cl::desc("Emit type declarations for variables"), cl::init(true));
@@ -993,13 +998,6 @@ static void iotaTranslate(std::unique_ptr<Module> &module, std::unique_ptr<tool_
     }
     Out->os() << "   personality-initargs))\n\n";
 
-    errs() << "Undefined functions:\n";
-    for(auto &fn: module->functions()) {
-        if(fn.empty()) {
-            errs() << fn.getName() << "\n";
-        }
-    }
-
     unsigned functions_to_translate = 0;
     for(auto &fn: module->functions()) {
         if(!fn.empty() && !fn.isDefTriviallyDead()) {
@@ -1219,6 +1217,38 @@ int main(int argc, char **argv) {
         PM2.add(createStripSymbolsPass(true));
         PM2.add(createGlobalDCEPass());
         PM2.run(*module);
+    }
+
+    StringSet<> ProvidedSymbols;
+
+    for(auto &Filename: ProvidedSymbolFiles) {
+        auto BufferOrErr = MemoryBuffer::getFile(Filename);
+        if (std::error_code ec = BufferOrErr.getError()) {
+            errs() << Filename << ": " << ec.message() << '\n';
+            return -1;
+        }
+        auto &Buffer = *BufferOrErr.get();
+        auto LI = line_iterator(Buffer, true, '#');
+        while (!LI.is_at_eof()) {
+            ProvidedSymbols.insert(*LI);
+            ++LI;
+        }
+    }
+
+    StringSet<> UndefinedFunctions;
+
+    for(auto &fn: module->functions()) {
+        if(fn.empty() && ProvidedSymbols.find(fn.getName()) == ProvidedSymbols.end()) {
+            UndefinedFunctions.insert(fn.getName());
+        }
+    }
+
+    if (!UndefinedFunctions.empty()) {
+        errs() << "Undefined functions:\n";
+        for(auto &val: UndefinedFunctions) {
+            errs() << val.first() << "\n";
+        }
+        return -1;
     }
 
     iotaTranslate(module, Out);
