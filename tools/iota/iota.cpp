@@ -1140,6 +1140,10 @@ int main(int argc, char **argv) {
         OutputFilename = "-";
     }
 
+    for(char &ch: OptimizeQualities) {
+        if(ch == '+') ch = ' ';
+    }
+
     std::error_code OutEC;
     std::unique_ptr<tool_output_file> Out(
         new tool_output_file(OutputFilename, OutEC, sys::fs::F_None));
