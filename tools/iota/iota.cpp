@@ -1163,7 +1163,13 @@ int main(int argc, char **argv) {
     }
 
     // Read in libraries.
+    StringSet<> LoadedLibraries;
     for (auto &Name: InputLibraries) {
+        if (LoadedLibraries.find(Name) != LoadedLibraries.end()) {
+            // Don't load libraries multiple times.
+            continue;
+        }
+        LoadedLibraries.insert(Name);
         std::string fullName = "lib" + Name + ".a";
         bool found = false;
         for (auto &Dir: LibrarySearchPaths) {
