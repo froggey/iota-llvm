@@ -19,4 +19,4 @@
 type = Tool
 name = iota
 parent = Tools
-required_libraries = AsmParser BitReader IRReader NaClAnalysis NaClTransforms
+required_libraries = AsmParser BitReader IRReader Linker NaClAnalysis NaClTransforms

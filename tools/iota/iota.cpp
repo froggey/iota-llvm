@@ -12,7 +12,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-
+#include "llvm/Object/Archive.h"
+#include "llvm/Object/Binary.h"
+#include "llvm/Object/IRObjectFile.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Instructions.h"
@@ -20,11 +22,16 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/Transforms/NaCl.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Path.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/Linker/Linker.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/PrettyStackTrace.h"
@@ -41,8 +48,14 @@ extern void lowerBitcastTrunc(Module &M);
 extern void lowerVectorBswap(Module &M);
 extern void eliminateLifetimeIntrinsics(Module &M);
 
-static cl::opt<std::string>
-InputFilename(cl::Positional, cl::desc("<input file>"), cl::Required);
+static cl::list<std::string>
+InputFilenames(cl::Positional, cl::desc("<input files>"), cl::OneOrMore);
+
+static cl::list<std::string>
+LibrarySearchPaths("L", cl::desc("Library search paths"), cl::ZeroOrMore, cl::Prefix);
+
+static cl::list<std::string>
+InputLibraries("l", cl::desc("Libraries to link"), cl::ZeroOrMore, cl::Prefix);
 
 static cl::opt<bool>
 EmitTypeDeclarartions("emit-type-declarations", cl::desc("Emit type declarations for variables"), cl::init(true));
@@ -1006,6 +1019,91 @@ static void iotaTranslate(std::unique_ptr<Module> &module, std::unique_ptr<tool_
     }
 }
 
+static void diagnosticHandler(const DiagnosticInfo &DI) {
+  unsigned Severity = DI.getSeverity();
+  switch (Severity) {
+  case DS_Error:
+    errs() << "ERROR: ";
+    break;
+  case DS_Warning:
+    errs() << "WARNING: ";
+    break;
+  case DS_Remark:
+  case DS_Note:
+    llvm_unreachable("Only expecting warnings and errors");
+  }
+
+  DiagnosticPrinterRawOStream DP(errs());
+  DI.print(DP);
+  errs() << '\n';
+}
+
+ErrorOr<object::OwningBinary<object::Binary>> createBinary(StringRef Path, LLVMContext *Context) {
+    using namespace object;
+  ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
+      MemoryBuffer::getFileOrSTDIN(Path);
+  if (std::error_code EC = FileOrErr.getError())
+    return EC;
+  std::unique_ptr<MemoryBuffer> &Buffer = FileOrErr.get();
+
+  ErrorOr<std::unique_ptr<Binary>> BinOrErr =
+      createBinary(Buffer->getMemBufferRef(), Context);
+  if (std::error_code EC = BinOrErr.getError())
+    return EC;
+  std::unique_ptr<Binary> &Bin = BinOrErr.get();
+
+  return OwningBinary<Binary>(std::move(Bin), std::move(Buffer));
+}
+
+static bool readInputFile(StringRef Path, LLVMContext *Context, Linker *L) {
+    auto BinaryOrErr = createBinary(Path, Context);
+    if (std::error_code ec = BinaryOrErr.getError()) {
+        errs() << Path << ": " << ec.message() << '\n';
+        return false;
+    }
+    object::Binary &Bin = *BinaryOrErr.get().getBinary();
+
+    if (object::IRObjectFile *IR = dyn_cast<object::IRObjectFile>(&Bin)) {
+        auto &M = IR->getModule();
+        if (verifyModule(M, &errs())) {
+            errs() << Path << ": error: input module is broken!\n";
+            return false;
+        }
+
+        if (L->linkInModule(&M))
+            return false;
+    } else if (object::Archive *Archive = dyn_cast<object::Archive>(&Bin)) {
+        for(auto &ArchiveChild: Archive->children()) {
+            auto ChildOrErr = ArchiveChild.getAsBinary(Context);
+            if (std::error_code ec = ChildOrErr.getError()) {
+                errs() << Path << ": " << ArchiveChild.getRawName() << ": "
+                       << ec.message() << '\n';
+                return false;
+            }
+            if (object::IRObjectFile *ChildIR = dyn_cast<object::IRObjectFile>(&*ChildOrErr.get())) {
+                auto &M = ChildIR->getModule();
+                if (verifyModule(M, &errs())) {
+                    errs() << Path << ": " << ArchiveChild.getRawName()
+                           << ": error: input module is broken!\n";
+                    return false;
+                }
+
+                if (L->linkInModule(&M))
+                    return false;
+            } else {
+                errs() << Path << ": "
+                       << ArchiveChild.getRawName()
+                       << ": unrecognizable file type\n";
+                return false;
+            }
+        }
+    } else {
+        errs() << Path << ": unrecognizable file type\n";
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char **argv) {
     sys::PrintStackTraceOnErrorSignal();
     PrettyStackTraceProgram X(argc, argv);
@@ -1026,21 +1124,45 @@ int main(int argc, char **argv) {
         OutputFilename = "-";
     }
 
-    std::error_code EC;
+    std::error_code OutEC;
     std::unique_ptr<tool_output_file> Out(
-        new tool_output_file(OutputFilename, EC, sys::fs::F_None));
-    if (EC) {
-      errs() << EC.message() << '\n';
+        new tool_output_file(OutputFilename, OutEC, sys::fs::F_None));
+    if (OutEC) {
+      errs() << OutEC.message() << '\n';
       return -1;
     }
 
     LLVMContext context;
-    SMDiagnostic err;
-    auto module = parseIRFile(InputFilename, err, context);
 
-    if(!module) {
-        err.print("iota", errs());
-        return -1;
+    auto module = make_unique<Module>("iota", context);
+    Linker L(module.get(), diagnosticHandler);
+
+    // Read in ordinary input files.
+    for (auto &Path: InputFilenames) {
+        if(!readInputFile(Path, &context, &L)) {
+            return -1;
+        }
+    }
+
+    // Read in libraries.
+    for (auto &Name: InputLibraries) {
+        std::string fullName = "lib" + Name + ".a";
+        bool found = false;
+        for (auto &Dir: LibrarySearchPaths) {
+            SmallString<128> P(Dir);
+            llvm::sys::path::append(P, fullName);
+            if (llvm::sys::fs::exists(Twine(P))) {
+                found = true;
+                if(!readInputFile(P, &context, &L)) {
+                    return -1;
+                }
+                break;
+            }
+        }
+        if (!found) {
+            errs() << "Can't find library " << Name << '\n';
+            return -1;
+        }
     }
 
     if(!TranslateOnly) {

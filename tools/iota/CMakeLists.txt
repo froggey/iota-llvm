@@ -4,6 +4,7 @@ set(LLVM_LINK_COMPONENTS
   CodeGen
   Core
   IRReader
+  Linker
   NaClAnalysis
   NaClTransforms
   ScalarOpts
